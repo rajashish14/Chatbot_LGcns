@@ -1,77 +1,156 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const path = require('path');
 const Message = require('../models/Message');
+const User = require('../models/User');
+const upload = multer({ dest: 'uploads/' });
 
-// Get chat history between two users
-router.get('/:from/:to', async (req, res) => {
+// Send a message
+router.post('/', upload.single('media'), async (req, res) => {
   try {
-    const { from, to } = req.params;
-    const chat = await Message.find({
-      $or: [
-        { from, to },
-        { from: to, to: from }
-      ]
-    }).sort({ timestamp: 1 });
-    const filtered = chat.filter(msg => !(msg.deletedBy && msg.deletedBy.includes(from)));
-    res.json(filtered);
+    const { from, to, text, replyTo, groupId, forwardOf } = req.body;
+    const mediaUrl = req.file ? `/uploads/${req.file.filename}` : null;
+
+    const newMsg = new Message({
+      from,
+      to,
+      text,
+      replyTo,
+      groupId,
+      forwardOf,
+      mediaUrl,
+      timestamp: Date.now(),
+      status: 'sent'
+    });
+
+    await newMsg.save();
+
+    const io = req.app.get('io');
+    if (groupId) {
+      io.to(groupId).emit('receive-message', newMsg);
+    } else {
+      // Check if receiver is online for delivery status
+      const receiverSocket = io.sockets.adapter.rooms.get(to);
+      if (receiverSocket && receiverSocket.size > 0) {
+        newMsg.status = 'delivered';
+        await newMsg.save();
+      }
+      
+      // Only emit to receiver (sender will get it from their own UI update)
+      io.to(to).emit('receive-message', newMsg);
+      
+       // Send delivery status to sender if receiver is online
+      if (receiverSocket && receiverSocket.size > 0) {
+        io.to(from).emit('message-status-update', { 
+          _id: newMsg._id,
+          timestamp: newMsg.timestamp, 
+          status: 'delivered' 
+        });
+      }
+    }
+
+    res.json(newMsg);
   } catch (err) {
-    res.status(500).json({ error: 'Server error' });
+    console.error('Send message error:', err);
+    res.status(500).json({ error: 'Send failed' });
   }
 });
 
-// Send message
-router.post('/', async (req, res) => {
-  const { from, to, text } = req.body;
-  const now = Date.now();
-  await Message.create({
-    from,
-    to,
-    text,
-    timestamp: now,
-    editableUntil: now + 60 * 1000,
-    deletedBy: [],
-  });
-  res.json({ success: true });
+// Update message to seen
+router.post('/seen', async (req, res) => {
+  const { messageIds, user } = req.body;
+  
+  try {
+    await Message.updateMany(
+      { _id: { $in: messageIds }, to: user },
+      { $set: { status: 'seen' } }
+    );
+    
+    // Notify sender(s) - get updated messages
+    const msgs = await Message.find({ _id: { $in: messageIds } });
+    const io = req.app.get('io');
+    
+    msgs.forEach(msg => {
+      io.to(msg.from).emit('message-status-update', { 
+        _id: msg._id,
+        timestamp: msg.timestamp, 
+        status: 'seen' 
+      });
+    });
+    
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error updating seen status:', error);
+    res.status(500).json({ error: 'Failed to update seen status' });
+  }
 });
 
-// Edit message (only within 1 minute, only by sender)
+// Typing Indicator
+router.post('/typing', (req, res) => {
+  const { from, to } = req.body;
+  req.app.get('io').to(to).emit('typing', { from });
+  res.json({ ok: true });
+});
+
+// Edit message
 router.put('/edit', async (req, res) => {
   const { from, to, timestamp, newText } = req.body;
-  const msg = await Message.findOne({ from, to, timestamp });
-  if (!msg) return res.status(404).json({ error: 'Message not found' });
-  if (Date.now() > msg.editableUntil) return res.status(403).json({ error: 'Edit time expired' });
-  msg.text = newText;
-  await msg.save();
-  res.json({ success: true });
+  const msg = await Message.findOneAndUpdate(
+    { from, to, timestamp },
+    { $set: { text: newText, edited: true } },
+    { new: true }
+  );
+  if (msg) {
+    req.app.get('io').to(to).emit('message-edited', msg);
+    res.json(msg);
+  } else {
+    res.status(404).json({ error: 'Not found' });
+  }
 });
 
-// Delete message for self (any time)
+// Delete for me
 router.put('/delete-for-me', async (req, res) => {
-  const { from, to, timestamp, user } = req.body;
-  const msg = await Message.findOne({
-    $or: [
-      { from, to, timestamp },
-      { from: to, to: from, timestamp }
-    ]
-  });
-  if (!msg) return res.status(404).json({ error: 'Message not found' });
-  if (!msg.deletedBy.includes(user)) {
-    msg.deletedBy.push(user);
+  const { user, timestamp } = req.body;
+  const msg = await Message.findOne({ timestamp });
+  if (msg && !msg.hiddenFor.includes(user)) {
+    msg.hiddenFor.push(user);
     await msg.save();
   }
-  res.json({ success: true });
+  res.json({ ok: true });
 });
 
-// Delete message for everyone (within 30 minutes, only by sender)
+// Delete for everyone
 router.put('/delete-for-everyone', async (req, res) => {
-  const { from, to, timestamp } = req.body;
-  const msg = await Message.findOne({ from, to, timestamp });
-  if (!msg) return res.status(404).json({ error: 'Message not found' });
-  if (Date.now() - msg.timestamp > 30 * 60 * 1000) {
-    return res.status(403).json({ error: 'Delete for everyone expired' });
+  const { timestamp } = req.body;
+  const msg = await Message.findOneAndUpdate(
+    { timestamp },
+    { $set: { text: 'This message was deleted', deletedForEveryone: true } },
+    { new: true }
+  );
+  if (msg) {
+    req.app.get('io').to(msg.to).emit('message-deleted', msg);
+    res.json({ ok: true });
+  } else {
+    res.status(404).json({ error: 'Not found' });
   }
-  await Message.deleteOne({ _id: msg._id });
-  res.json({ success: true });
+});
+
+// Get all messages (1-1 or group)
+router.get('/:user1/:user2', async (req, res) => {
+  const { user1, user2 } = req.params;
+  try {
+    const messages = await Message.find({
+      $or: [
+        { from: user1, to: user2 },
+        { from: user2, to: user1 },
+        { groupId: user2 },
+      ],
+    }).sort({ timestamp: 1 });
+    res.json(messages);
+  } catch (err) {
+    res.status(500).json({ error: 'Fetch failed' });
+  }
 });
 
 module.exports = router;
